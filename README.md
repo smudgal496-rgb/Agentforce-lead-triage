@@ -1,58 +1,67 @@
-# Salesforce DX Project
+# Lead AI Triage — Agentforce-Pattern Custom Action
 
-Salesforce DX is a development approach that brings source-driven development, team collaboration, and continuous integration to the Salesforce Platform. Instead of working directly in an org through a web browser, you work with metadata as source files in a local DX project, track changes in version control, and deploy through automated processes.
+An AI-driven lead scoring agent built on Salesforce, using a custom Apex Invocable Action wired to Google's Gemini API. Designed to plug directly into Salesforce's Agentforce Action framework; demonstrated here via a Record-Triggered Flow due to Developer Edition licensing limits on the build environment.
 
-This project template gets you started with the tools and structure you need to build Salesforce applications using source control, scratch orgs, and the Salesforce CLI.
+## What it does
 
-## Prerequisites
+When a new Lead is created in Salesforce:
+1. A Record-Triggered Flow fires asynchronously (required for any Flow making an external callout).
+2. The Flow invokes a custom Apex Action (`LeadTriageAction.triageLeads`).
+3. That action builds a structured prompt from the Lead's Company, Industry, Lead Source, and Description, and calls Google's Gemini API via a Named Credential.
+4. The model returns a strict-JSON triage decision — a priority tier (Hot/Warm/Cold) and a short rationale.
+5. The Lead record is updated automatically with the result — no manual intervention required.
 
-Before you start, make sure you have:
+## Demo
 
-- **Salesforce CLI** - Download from [developer.salesforce.com/tools/salesforcecli](https://developer.salesforce.com/tools/salesforcecli). See [Install Salesforce CLI](https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_install_cli.htm) for details.
-- **VS Code with Salesforce Extension Pack** - See [Installation Instructions](https://developer.salesforce.com/docs/platform/sfvscode-extensions/guide/install.html) for details. Includes the Agentforce Vibes extension.
-- **A development org** - Sign up for a free Developer Edition org [here](https://developer.salesforce.com/signup).
-- **Dev Hub enabled** (optional, required to create scratch orgs) - You can enable Dev Hub in your development org under Setup > Dev Hub.  See [Provide Developers Access to Salesforce DX Tools](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_setup_dx_tools.htm).
+*(screenshot or GIF of a Lead being created, then refreshed to show the populated AI Priority Score / AI Rationale / AI Last Run fields)*
 
-## Project Structure
+## Architecture
 
-Your DX project follows this structure:
+```
+Lead created
+   → Record-Triggered Flow (async path)
+      → LeadTriageAction.triageLeads() [Apex Invocable Method]
+         → GoogleService.callClaude() [HTTP callout via Named Credential]
+            → Gemini API (gemini-3-flash-preview)
+         ← structured JSON response
+      ← Lead record updated: AI_Priority_Score__c, AI_Rationale__c, AI_Last_Run__c
+```
 
-- **`force-app/main/default/`** - Your metadata source files live in this default package directory. You can configure additional package directories in the `sfdx-project.json` file.
-- **`config/`** - Scratch org definitions and project settings
-- **`scripts/`** - Automation scripts for common tasks
-- **`sfdx-project.json`** - Project manifest that defines package directories, namespace, API version, and other project-level settings
+## Why an Invocable Method, not hardcoded logic
 
-See [Salesforce DX Project Configuration](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_ws_config.htm).
+The core triage logic lives in a Salesforce `@InvocableMethod`, not inline in the Flow or a trigger. This is deliberate: an Invocable Method is the same interface Agentforce's Agent Builder expects for custom Actions. The Apex code required zero changes between "called from a Flow" and "callable from Agent Builder" — only the orchestration layer differs. See [Design Notes](#design-notes) below for why Flow was used instead of native Agentforce here.
 
-## Get Started
+## Setup
 
-Ready to start developing? The [Get Started with Salesforce DX](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_get_started_dx.htm) guide walks you through your first project, from creating a scratch org to creating a simple Apex class or LWC to deploying your code to a sandbox.
+1. **Salesforce org** — requires a standard Developer Edition (not Starter Edition — Apex is not supported on Starter).
+2. **Custom fields on Lead:**
+   - `AI_Priority_Score__c` (Picklist: Hot, Warm, Cold)
+   - `AI_Rationale__c` (Long Text Area, 500 chars)
+   - `AI_Last_Run__c` (Date/Time)
+3. **Gemini API key** — free tier via [Google AI Studio](https://aistudio.google.com), no billing required.
+4. **Named Credential** — `Google_API`, pointing to `https://generativelanguage.googleapis.com`, with a custom header `x-goog-api-key` set to your Gemini key. See `/docs` (or ask) for full step-by-step External Credential + Principal Access configuration — this took several iterations to get right (see Known Issues below) and is worth doing carefully.
+5. Deploy:
+   ```
+   sf project deploy start --source-dir force-app
+   ```
+6. Build and activate the Record-Triggered Flow on Lead (Create trigger, async path required — see Design Notes).
 
-## Common Salesforce CLI Commands
+## Design notes
 
-Here are common CLI commands that you'll use the most:
+- **Why Flow instead of native Agentforce Agent Builder:** the development org used for this project (Developer Edition) does not include an Agentforce license — "Purchase required" appears when attempting to enable Agent Builder. The Apex Invocable Method pattern was deliberately chosen so this project could demonstrate the identical custom-action design Agentforce expects, without requiring a licensed org. A production deployment on an Agentforce-licensed org would attach this same `LeadTriageAction` class directly as an Agent Action instead of a Flow.
+- **Why an async Flow path, specifically:** Salesforce blocks HTTP callouts from the same transaction as uncommitted DML — since a newly created Lead's own insert is itself uncommitted work at the moment a "Run Immediately" Flow path would fire, the callout fails with `You have uncommitted work pending`. The async path defers execution until after the triggering transaction commits, which is a hard platform requirement for any Flow doing external callouts, not just a performance choice.
+- **Why Gemini instead of Claude:** originally built and tested against Claude's API. Switched to Gemini's free tier partway through development to avoid a billing dependency on a portfolio project. See `PROMPT_DESIGN.md` for the full note on what did and didn't change in that migration.
 
-- `sf org login web`: Authorize an org
-- `sf org open`: Open your org in a browser
-- `sf org create scratch`: Create a scratch org
-- `sf project deploy start`: Deploy metadata to your org
-- `sf project retrieve start`: Retrieve metadata from your org
-- `sf template generate <artifact>`: Scaffold new components, such as Apex classes and triggers, LWC components, Lightning apps, and more
-- `sf apex <command>`: Run Apex tests, run anonymous Apex blocks, and view logs
-- `sf data <command>`: Work with test data
-- `sf alias <command>`: Manage org aliases
-- `sf config <command>`: Configure CLI settings
+## Known issues encountered during development (kept intentionally, not scrubbed)
 
-## Use Agentforce Vibes to Build Lightning Apps
+- Early Named Credential setup duplicated auth headers across both the External Credential Principal and the Named Credential's own Custom Headers section, causing a silent auth failure. Resolved by keeping headers in exactly one place (Named Credential Custom Headers).
+- Free-tier Gemini model names are unstable — two model versions used during development (`gemini-2.5-flash`, `gemini-2.5-flash-lite`) were deprecated for new API keys mid-project. Final version targets `gemini-3-flash-preview`, confirmed live via direct testing in AI Studio rather than trusting documentation alone.
+- `LIMIT 1` in early manual test scripts, with no `ORDER BY`, non-deterministically selected among multiple Lead records in the org — a reminder that "it worked in my test" and "it updated the record I meant to update" are different claims.
 
-Transform your ideas into custom Lightning apps that extend CRM workflows directly in Lightning Experience. Through natural conversations with Agentforce Vibes, implement custom objects and fields, complex business logic, and dynamic UI components. See [Build a Lightning App Using Agentforce Vibes](https://developer.salesforce.com/docs/platform/einstein-for-devs/guide/lexapp-overview.html).
+## Tech stack
 
-## Additional Resources
+Apex · Salesforce Flow (async) · Named Credentials / External Credentials · Google Gemini API · Salesforce CLI
 
-- [Agentforce Vibes Developer Guide](https://developer.salesforce.com/docs/platform/einstein-for-devs/guide/einstein-overview.html)
-- [Salesforce CLI Installation Guide](https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_intro.htm)
-- [Salesforce DX Developer Guide](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/)
-- [Salesforce CLI Command Reference](https://developer.salesforce.com/docs/atlas.en-us.sfdx_cli_reference.meta/sfdx_cli_reference/)
-- [Salesforce CLI Plugin Development Guide](https://developer.salesforce.com/docs/platform/salesforce-cli-plugin/guide/conceptual-overview.html)
-- [Salesforce VS Code Extensions Documentation](https://developer.salesforce.com/tools/vscode/)
+## License
 
+MIT
